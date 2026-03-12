@@ -1,0 +1,23 @@
+{
+  "name": "x402-disposable-email",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-12",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "INBOXES",
+      "id": "b57bc2c876d04543acc7daf77bdce0d4"
+    }
+  ],
+  "vars": {
+    "SERVER_ADDRESS": "0x34D3eD2c5Fc6D6A0F25d1Aad77193a8AA88A52b5"
+  },
+  "routes": [
+    {
+      "pattern": "inbox.camelai.io",
+      "custom_domain": true
+    }
+  ]
+}
