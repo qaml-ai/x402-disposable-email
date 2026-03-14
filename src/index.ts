@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
+import { stripeApiKeyMiddleware } from "x402-stripe";
 import { extractParams } from "x402-ai";
 import { nanoid } from "nanoid";
 import PostalMime from "postal-mime";
@@ -21,8 +22,11 @@ Examples:
 - {"action": "create"}
 - {"action": "check", "inbox_id": "abc123def0"}`;
 
-app.use(
-  cdpPaymentMiddleware(
+app.use(stripeApiKeyMiddleware({ serviceName: "disposable-email" }));
+
+app.use(async (c, next) => {
+  if (c.get("skipX402")) return next();
+  return cdpPaymentMiddleware(
     (env) => ({
       "POST /": {
         accepts: [
@@ -60,8 +64,8 @@ app.use(
         },
       },
     })
-  )
-);
+  )(c, next);
+});
 
 app.post("/", async (c) => {
   const body = await c.req.json<{ input?: string }>();

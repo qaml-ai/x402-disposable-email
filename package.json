@@ -15,7 +15,8 @@
     "x402-cdp": "file:../x402-cdp",
     "hono": "^4.12.7",
     "nanoid": "^5.1.5",
-    "postal-mime": "^2.4.1"
+    "postal-mime": "^2.4.1",
+    "x402-stripe": "file:../x402-stripe"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250312.0",

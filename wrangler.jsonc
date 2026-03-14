@@ -9,6 +9,10 @@
     {
       "binding": "INBOXES",
       "id": "b57bc2c876d04543acc7daf77bdce0d4"
+    },
+    {
+      "binding": "API_KEYS",
+      "id": "d60ccd7d1840419ea47fb63caee0ebf0"
     }
   ],
   "vars": {
