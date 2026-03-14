@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
-import { describeRoute, openAPIRouteHandler } from "hono-openapi";
+import { extractParams } from "x402-ai";
 import { nanoid } from "nanoid";
 import PostalMime from "postal-mime";
 
@@ -8,23 +8,23 @@ const app = new Hono<{ Bindings: Env }>();
 
 const INBOX_TTL = 3600; // 1 hour in seconds
 
-// OpenAPI spec — must be before paymentMiddleware
-app.get("/.well-known/openapi.json", openAPIRouteHandler(app, {
-  documentation: {
-    info: {
-      title: "x402 Disposable Email Service",
-      description: "Create temporary disposable email inboxes and check for received messages. Pay-per-use via x402 protocol on Base mainnet.",
-      version: "1.0.0",
-    },
-    servers: [{ url: "https://inbox.camelai.io" }],
-  },
-}));
+const SYSTEM_PROMPT = `You are a parameter extractor for a disposable email inbox service.
+Extract the following from the user's message and return JSON:
+- "action": either "create" (create a new inbox) or "check" (check an existing inbox for messages). Default "create". (required)
+- "inbox_id": the inbox ID to check. Required if action is "check". (optional)
 
-// x402 payment gates
+If the user mentions creating, making, or getting a new email/inbox, set action to "create".
+If the user mentions checking, reading, viewing messages, or provides an inbox ID, set action to "check".
+
+Return ONLY valid JSON, no explanation.
+Examples:
+- {"action": "create"}
+- {"action": "check", "inbox_id": "abc123def0"}`;
+
 app.use(
   cdpPaymentMiddleware(
     (env) => ({
-      "POST /inbox": {
+      "POST /": {
         accepts: [
           {
             scheme: "exact",
@@ -33,35 +33,26 @@ app.use(
             payTo: env.SERVER_ADDRESS as `0x${string}`,
           },
         ],
-        description: "Create a temporary disposable email inbox",
+        description: "Create a disposable email inbox or check for received messages. Send {\"input\": \"your request\"}",
         mimeType: "application/json",
         extensions: {
           bazaar: {
-            discoverable: true,
-            inputSchema: {},
-          },
-        },
-      },
-      "GET /inbox/:id": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.005",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Check a disposable inbox for received messages",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              pathParams: {
-                id: {
-                  type: "string",
-                  description: "The inbox ID",
-                  required: true,
+            info: {
+              input: {
+                type: "http",
+                method: "POST",
+                bodyType: "json",
+                body: {
+                  input: { type: "string", description: "Describe what you want: create a new inbox or check an existing one", required: true },
+                },
+              },
+              output: { type: "json" },
+            },
+            schema: {
+              properties: {
+                input: {
+                  properties: { method: { type: "string", enum: ["POST"] } },
+                  required: ["method"],
                 },
               },
             },
@@ -72,14 +63,38 @@ app.use(
   )
 );
 
-// Paid endpoint: create a temporary inbox
-app.post("/inbox", describeRoute({
-  description: "Create a temporary disposable email inbox. Expires after 1 hour. Requires x402 payment ($0.005).",
-  responses: {
-    200: { description: "Inbox created", content: { "application/json": { schema: { type: "object" } } } },
-    402: { description: "Payment required" },
-  },
-}), async (c) => {
+app.post("/", async (c) => {
+  const body = await c.req.json<{ input?: string }>();
+  if (!body?.input) {
+    return c.json({ error: "Missing 'input' field" }, 400);
+  }
+
+  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
+  const action = ((params.action as string) || "create").toLowerCase();
+
+  if (action === "check") {
+    // --- Check inbox for messages ---
+    const id = params.inbox_id as string;
+    if (!id) {
+      return c.json({ error: "Could not determine inbox_id to check" }, 400);
+    }
+
+    const metadataRaw = await c.env.INBOXES.get(`inbox:${id}`);
+    if (!metadataRaw) {
+      return c.json({ error: "Inbox not found or expired" }, 404);
+    }
+
+    const metadata = JSON.parse(metadataRaw);
+    const messagesRaw = await c.env.INBOXES.get(`inbox:${id}:messages`);
+    const messages = messagesRaw ? JSON.parse(messagesRaw) : [];
+
+    return c.json({
+      email: metadata.email,
+      messages,
+    });
+  }
+
+  // --- Create inbox (default) ---
   const id = nanoid(10);
   const host = new URL(c.req.url).hostname;
   const email = `${id}@${host}`;
@@ -105,51 +120,57 @@ app.post("/inbox", describeRoute({
   return c.json(metadata);
 });
 
-// Paid endpoint: check inbox for messages
-app.get("/inbox/:id", describeRoute({
-  description: "Check a disposable inbox for received messages. Requires x402 payment ($0.005).",
-  responses: {
-    200: { description: "Inbox messages", content: { "application/json": { schema: { type: "object" } } } },
-    402: { description: "Payment required" },
-    404: { description: "Inbox not found or expired" },
-  },
-}), async (c) => {
-  const id = c.req.param("id");
-
-  const metadataRaw = await c.env.INBOXES.get(`inbox:${id}`);
-  if (!metadataRaw) {
-    return c.json({ error: "Inbox not found or expired" }, 404);
-  }
-
-  const metadata = JSON.parse(metadataRaw);
-  const messagesRaw = await c.env.INBOXES.get(`inbox:${id}:messages`);
-  const messages = messagesRaw ? JSON.parse(messagesRaw) : [];
-
+app.get("/", (c) => {
   return c.json({
-    email: metadata.email,
-    messages,
+    service: "x402-disposable-email",
+    description: "Create temporary disposable email inboxes and check for messages. Send POST / with {\"input\": \"create a new inbox\" or \"check inbox abc123def0\"}",
+    price: "$0.005 per request (Base mainnet)",
   });
 });
 
-// Free endpoint: delete inbox
-app.delete("/inbox/:id", describeRoute({
-  description: "Delete a disposable inbox (free).",
-  responses: {
-    200: { description: "Inbox deleted", content: { "application/json": { schema: { type: "object" } } } },
-    404: { description: "Inbox not found or expired" },
-  },
-}), async (c) => {
-  const id = c.req.param("id");
-
-  const metadataRaw = await c.env.INBOXES.get(`inbox:${id}`);
-  if (!metadataRaw) {
-    return c.json({ error: "Inbox not found or expired" }, 404);
-  }
-
-  await c.env.INBOXES.delete(`inbox:${id}`);
-  await c.env.INBOXES.delete(`inbox:${id}:messages`);
-
-  return c.json({ deleted: true });
+app.get("/.well-known/openapi.json", (c) => {
+  return c.json({
+    "openapi": "3.1.0",
+    "info": {
+      "title": "x402 Disposable Email",
+      "description": "Create temporary email inboxes or check messages",
+      "version": "1.0.0",
+      "x-pricing": { "price": "$0.005", "currency": "USDC", "network": "Base (eip155:8453)" }
+    },
+    "servers": [{ "url": "https://inbox.camelai.io" }],
+    "paths": {
+      "/": {
+        "post": {
+          "summary": "Create temporary email inboxes or check messages",
+          "description": "Accepts natural language input. An LLM interprets your request and extracts the required parameters. Requires x402 payment ($0.005 USDC on Base).",
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["input"],
+                  "properties": {
+                    "input": { "type": "string", "description": "Describe what you want: create a new inbox or check an existing one" }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": { "description": "Inbox details or messages", "content": { "application/json": {} } },
+            "402": { "description": "Payment Required — sign a USDC payment on Base and resend with the payment header" },
+            "400": { "description": "Bad request — could not interpret input" }
+          }
+        },
+        "get": {
+          "summary": "Service info",
+          "description": "Returns service metadata, description, and pricing",
+          "responses": { "200": { "description": "Service info", "content": { "application/json": {} } } }
+        }
+      }
+    }
+  });
 });
 
 // Export both fetch handler (Hono) and email handler (Cloudflare Email Workers)
