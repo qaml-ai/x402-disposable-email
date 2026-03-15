@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
 import { stripeApiKeyMiddleware } from "x402-stripe";
-import { extractParams } from "x402-ai";
 import { nanoid } from "nanoid";
 import PostalMime from "postal-mime";
 
@@ -9,96 +8,36 @@ const app = new Hono<{ Bindings: Env }>();
 
 const INBOX_TTL = 3600; // 1 hour in seconds
 
-const SYSTEM_PROMPT = `You are a parameter extractor for a disposable email inbox service.
-Extract the following from the user's message and return JSON:
-- "action": either "create" (create a new inbox) or "check" (check an existing inbox for messages). Default "create". (required)
-- "inbox_id": the inbox ID to check. Required if action is "check". (optional)
-
-If the user mentions creating, making, or getting a new email/inbox, set action to "create".
-If the user mentions checking, reading, viewing messages, or provides an inbox ID, set action to "check".
-
-Return ONLY valid JSON, no explanation.
-Examples:
-- {"action": "create"}
-- {"action": "check", "inbox_id": "abc123def0"}`;
+const PAYMENT_CONFIG = (env: Env) => ({
+  "POST /": {
+    accepts: [
+      { scheme: "exact" as const, price: "$0.005", network: "eip155:8453", payTo: env.SERVER_ADDRESS as `0x${string}` },
+      { scheme: "exact" as const, price: "$0.005", network: "eip155:137", payTo: env.SERVER_ADDRESS as `0x${string}` },
+      { scheme: "exact" as const, price: "$0.005", network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", payTo: "CvraJ4avKPpJNLvMhMH5ip2ihdt85PXvDwfzXdziUxRq" },
+    ],
+    description: "Create a disposable email inbox. No body needed.",
+    mimeType: "application/json",
+  },
+  "POST /check": {
+    accepts: [
+      { scheme: "exact" as const, price: "$0.005", network: "eip155:8453", payTo: env.SERVER_ADDRESS as `0x${string}` },
+      { scheme: "exact" as const, price: "$0.005", network: "eip155:137", payTo: env.SERVER_ADDRESS as `0x${string}` },
+      { scheme: "exact" as const, price: "$0.005", network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", payTo: "CvraJ4avKPpJNLvMhMH5ip2ihdt85PXvDwfzXdziUxRq" },
+    ],
+    description: "Check an inbox for messages. Send {\"inbox_id\": \"your-inbox-id\"}",
+    mimeType: "application/json",
+  },
+});
 
 app.use(stripeApiKeyMiddleware({ serviceName: "disposable-email" }));
 
 app.use(async (c, next) => {
   if (c.get("skipX402")) return next();
-  return cdpPaymentMiddleware(
-    (env) => ({
-      "POST /": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.005",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Create a disposable email inbox or check for received messages. Send {\"input\": \"your request\"}",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            info: {
-              input: {
-                type: "http",
-                method: "POST",
-                bodyType: "json",
-                body: {
-                  input: { type: "string", description: "Describe what you want: create a new inbox or check an existing one", required: true },
-                },
-              },
-              output: { type: "json" },
-            },
-            schema: {
-              properties: {
-                input: {
-                  properties: { method: { type: "string", enum: ["POST"] } },
-                  required: ["method"],
-                },
-              },
-            },
-          },
-        },
-      },
-    })
-  )(c, next);
+  return cdpPaymentMiddleware(PAYMENT_CONFIG)(c, next);
 });
 
+// Create inbox — no body needed
 app.post("/", async (c) => {
-  const body = await c.req.json<{ input?: string }>();
-  if (!body?.input) {
-    return c.json({ error: "Missing 'input' field" }, 400);
-  }
-
-  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
-  const action = ((params.action as string) || "create").toLowerCase();
-
-  if (action === "check") {
-    // --- Check inbox for messages ---
-    const id = params.inbox_id as string;
-    if (!id) {
-      return c.json({ error: "Could not determine inbox_id to check" }, 400);
-    }
-
-    const metadataRaw = await c.env.INBOXES.get(`inbox:${id}`);
-    if (!metadataRaw) {
-      return c.json({ error: "Inbox not found or expired" }, 404);
-    }
-
-    const metadata = JSON.parse(metadataRaw);
-    const messagesRaw = await c.env.INBOXES.get(`inbox:${id}:messages`);
-    const messages = messagesRaw ? JSON.parse(messagesRaw) : [];
-
-    return c.json({
-      email: metadata.email,
-      messages,
-    });
-  }
-
-  // --- Create inbox (default) ---
   const id = nanoid(10);
   const host = new URL(c.req.url).hostname;
   const email = `${id}@${host}`;
@@ -111,12 +50,10 @@ app.post("/", async (c) => {
     expires_at: expiresAt,
   };
 
-  // Store inbox metadata with TTL
   await c.env.INBOXES.put(`inbox:${id}`, JSON.stringify(metadata), {
     expirationTtl: INBOX_TTL,
   });
 
-  // Initialize empty messages list with same TTL
   await c.env.INBOXES.put(`inbox:${id}:messages`, JSON.stringify([]), {
     expirationTtl: INBOX_TTL,
   });
@@ -124,10 +61,33 @@ app.post("/", async (c) => {
   return c.json(metadata);
 });
 
+// Check inbox for messages
+app.post("/check", async (c) => {
+  const body = await c.req.json<{ inbox_id?: string }>();
+  if (!body?.inbox_id) {
+    return c.json({ error: "Missing 'inbox_id' field" }, 400);
+  }
+
+  const id = body.inbox_id.trim();
+  const metadataRaw = await c.env.INBOXES.get(`inbox:${id}`);
+  if (!metadataRaw) {
+    return c.json({ error: "Inbox not found or expired" }, 404);
+  }
+
+  const metadata = JSON.parse(metadataRaw);
+  const messagesRaw = await c.env.INBOXES.get(`inbox:${id}:messages`);
+  const messages = messagesRaw ? JSON.parse(messagesRaw) : [];
+
+  return c.json({
+    email: metadata.email,
+    messages,
+  });
+});
+
 app.get("/", (c) => {
   return c.json({
     service: "x402-disposable-email",
-    description: "Create temporary disposable email inboxes and check for messages. Send POST / with {\"input\": \"create a new inbox\" or \"check inbox abc123def0\"}",
+    description: "Create temporary email inboxes and check for messages. POST / to create, POST /check with {\"inbox_id\": \"...\"} to read.",
     price: "$0.005 per request (Base mainnet)",
   });
 });
@@ -145,32 +105,41 @@ app.get("/.well-known/openapi.json", (c) => {
     "paths": {
       "/": {
         "post": {
-          "summary": "Create temporary email inboxes or check messages",
-          "description": "Accepts natural language input. An LLM interprets your request and extracts the required parameters. Requires x402 payment ($0.005 USDC on Base).",
+          "summary": "Create a new disposable inbox",
+          "description": "Creates a temporary email inbox (1hr TTL). No body required. Requires x402 payment ($0.005 USDC on Base).",
+          "responses": {
+            "200": { "description": "Inbox details (email, inbox_id, expires_at)", "content": { "application/json": {} } },
+            "402": { "description": "Payment Required" }
+          }
+        },
+        "get": {
+          "summary": "Service info",
+          "responses": { "200": { "description": "Service info", "content": { "application/json": {} } } }
+        }
+      },
+      "/check": {
+        "post": {
+          "summary": "Check inbox for messages",
+          "description": "Returns messages received by an inbox. Requires x402 payment ($0.005 USDC on Base).",
           "requestBody": {
             "required": true,
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "required": ["input"],
+                  "required": ["inbox_id"],
                   "properties": {
-                    "input": { "type": "string", "description": "Describe what you want: create a new inbox or check an existing one" }
+                    "inbox_id": { "type": "string", "description": "The inbox ID returned from POST /" }
                   }
                 }
               }
             }
           },
           "responses": {
-            "200": { "description": "Inbox details or messages", "content": { "application/json": {} } },
-            "402": { "description": "Payment Required — sign a USDC payment on Base and resend with the payment header" },
-            "400": { "description": "Bad request — could not interpret input" }
+            "200": { "description": "Email and messages", "content": { "application/json": {} } },
+            "402": { "description": "Payment Required" },
+            "404": { "description": "Inbox not found or expired" }
           }
-        },
-        "get": {
-          "summary": "Service info",
-          "description": "Returns service metadata, description, and pricing",
-          "responses": { "200": { "description": "Service info", "content": { "application/json": {} } } }
         }
       }
     }
